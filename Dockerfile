@@ -31,6 +31,9 @@ RUN make go-generate build ENABLE_VIPS=true
 
 FROM alpine:3.20
 
+VOLUME [/var/lib/opencloud /etc/opencloud]
+WORKDIR /var/lib/opencloud
+
 RUN apk add --no-cache attr ca-certificates curl mailcap tree vips && \
 	echo 'hosts: files dns' >| /etc/nsswitch.conf
 
@@ -43,7 +46,11 @@ LABEL maintainer="OpenCloud GmbH <devops@opencloud.eu>" \
         org.opencontainers.image.documentation="https://github.com/opencloud-eu/opencloud" \
         org.opencontainers.image.source="https://github.com/opencloud-eu/opencloud"
 
-ENTRYPOINT ["/usr/bin/opencloud"]
-CMD ["server"]
+EXPOSE map[9200/tcp:{}]
 
 COPY --from=build /opencloud/opencloud/bin/opencloud /usr/bin/opencloud
+
+USER 1000
+
+ENTRYPOINT ["/usr/bin/opencloud"]
+CMD ["server"]
