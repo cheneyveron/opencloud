@@ -21,6 +21,7 @@ package trashbin
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -173,7 +174,14 @@ func (tb *Trashbin) MoveToTrash(ctx context.Context, n *node.Node, path string) 
 	itemTrashPath := filepath.Join(trashPath, "files", key+".trashitem")
 	err = os.Rename(path, itemTrashPath)
 	if err != nil {
-		return err
+		// If rename fails (e.g., cross-filesystem), try copy+delete approach
+		tb.log.Debug().Err(err).Str("src", path).Str("dst", itemTrashPath).Msg("rename failed, trying copy+delete")
+		if err := tb.copyFileOrDir(path, itemTrashPath); err != nil {
+			return err
+		}
+		if err := os.RemoveAll(path); err != nil {
+			return err
+		}
 	}
 
 	// 3. Purge the node from the metadata backend. This will not delete the xattrs from the
@@ -347,7 +355,14 @@ func (tb *Trashbin) RestoreRecycleItem(ctx context.Context, spaceID string, key,
 	// restore the item
 	err = os.Rename(trashPath, restorePath)
 	if err != nil {
-		return nil, err
+		// If rename fails (e.g., cross-filesystem), try copy+delete approach
+		tb.log.Debug().Err(err).Str("src", trashPath).Str("dst", restorePath).Msg("rename failed, trying copy+delete")
+		if err := tb.copyFileOrDir(trashPath, restorePath); err != nil {
+			return nil, err
+		}
+		if err := os.RemoveAll(trashPath); err != nil {
+			return nil, err
+		}
 	}
 	if err := tb.lu.CacheID(ctx, spaceID, id, restorePath); err != nil {
 		tb.log.Error().Err(err).Str("spaceID", spaceID).Str("id", id).Str("path", restorePath).Msg("trashbin: error caching id")
@@ -419,4 +434,78 @@ func (tb *Trashbin) IsEmpty(ctx context.Context, spaceID string) bool {
 	}
 	// if we cannot read the trash, we assume there are no trashed items
 	return true
+}
+
+// copyFileOrDir copies a file or directory from src to dst, handling cross-filesystem operations
+func (tb *Trashbin) copyFileOrDir(src, dst string) error {
+	srcInfo, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+
+	if srcInfo.IsDir() {
+		return tb.copyDir(src, dst, srcInfo)
+	}
+	return tb.copyFile(src, dst, srcInfo)
+}
+
+// copyFile copies a single file from src to dst
+func (tb *Trashbin) copyFile(src, dst string, srcInfo os.FileInfo) error {
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	dstFile, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, srcInfo.Mode())
+	if err != nil {
+		return err
+	}
+	defer dstFile.Close()
+
+	_, err = io.Copy(dstFile, srcFile)
+	if err != nil {
+		return err
+	}
+
+	// Copy file times
+	return os.Chtimes(dst, srcInfo.ModTime(), srcInfo.ModTime())
+}
+
+// copyDir recursively copies a directory from src to dst
+func (tb *Trashbin) copyDir(src, dst string, srcInfo os.FileInfo) error {
+	// Create destination directory
+	if err := os.MkdirAll(dst, srcInfo.Mode()); err != nil {
+		return err
+	}
+
+	// Read source directory
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+
+	// Copy each entry
+	for _, entry := range entries {
+		srcPath := filepath.Join(src, entry.Name())
+		dstPath := filepath.Join(dst, entry.Name())
+
+		entryInfo, err := entry.Info()
+		if err != nil {
+			return err
+		}
+
+		if entryInfo.IsDir() {
+			if err := tb.copyDir(srcPath, dstPath, entryInfo); err != nil {
+				return err
+			}
+		} else {
+			if err := tb.copyFile(srcPath, dstPath, entryInfo); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Copy directory times
+	return os.Chtimes(dst, srcInfo.ModTime(), srcInfo.ModTime())
 }
